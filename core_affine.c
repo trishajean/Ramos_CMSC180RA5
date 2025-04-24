@@ -123,7 +123,7 @@ void load_rows_from_file(const char *filename, int start_row, int end_row, int *
 }
 
 // Distribute submatrices to slaves
-void distribute_submatrices(ProgramState *state) {
+void distribute_submatrices(ProgramState *state, int *vector_y, int size) {
     struct timeval time_before, time_after;
     gettimeofday(&time_before, NULL);
 
@@ -133,7 +133,7 @@ void distribute_submatrices(ProgramState *state) {
 
     int start_row = 0;
 
-    for (int slave = 0; slave_count > slave; slave++) {
+    for (int slave = 0; slave < slave_count; slave++) {
         int rows_for_this_slave = base_rows_per_slave + (slave < extra_rows ? 1 : 0);  // Add 1 row for the first 'extra_rows' slaves
         printf("Sending data to slave %d at IP %s, Port %d\n", slave, state->slaves[slave].ip, state->slaves[slave].port);
 
@@ -146,11 +146,6 @@ void distribute_submatrices(ProgramState *state) {
         int buffer_size = 1024 * 1024; // 1 MB
         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
-
-        struct timeval timeout;
-        timeout.tv_sec = 120; // Increase to 120 seconds
-        timeout.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
         struct sockaddr_in slave_addr;
         memset(&slave_addr, 0, sizeof(slave_addr));
@@ -198,6 +193,21 @@ void distribute_submatrices(ProgramState *state) {
             fprintf(stderr, "Did not receive proper acknowledgment from slave %d\n", slave);
             exit(EXIT_FAILURE);
         }
+
+        // Send vector y
+        printf("Sending vector y to slave %d\n", slave);
+        ssize_t bytes_sent = 0;
+        ssize_t total_bytes = size * sizeof(int);
+        while (bytes_sent < total_bytes) {
+            ssize_t result = send(sock, (char *)vector_y + bytes_sent, total_bytes - bytes_sent, 0);
+            if (result < 0) {
+                perror("Failed to send vector y");
+                exit(EXIT_FAILURE);
+            }
+            bytes_sent += result;
+        }
+
+        printf("Successfully sent vector y to slave %d\n", slave);
 
         close(sock);
 
@@ -321,67 +331,56 @@ void compute_mse_parallel(int **submatrix, int rows, int cols, int *vector_y, do
     }
 }
 
-void compute_mse_and_send(ProgramState *state, int **submatrix, int rows, int cols, int master_sock) {
-    int *vector_y = (int *)malloc(cols * sizeof(int));
-    if (!vector_y) {
-        perror("Vector y allocation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Receive vector y
-    ssize_t vector_total_bytes = cols * sizeof(int); // Renamed variable
-    ssize_t bytes_received = 0;
-    while (bytes_received < vector_total_bytes) {
-        ssize_t result = recv(master_sock, (char *)vector_y + bytes_received, vector_total_bytes - bytes_received, 0);
-        if (result < 0) {
-            perror("Failed to receive vector y");
-            free(vector_y);
-            exit(EXIT_FAILURE);
-        }
-        bytes_received += result;
-    }
-
-    printf("Slave received vector y of size %d\n", cols);
-
-    // Start computation timer
-    struct timeval start, end;
-    gettimeofday(&start, NULL);
-
-    // Compute MSEs using parallel computation
+// Function to compute MSE only
+double *compute_mse_only(int **submatrix, int rows, int cols, int *vector_y) {
     double *mse = (double *)malloc(cols * sizeof(double));
     if (!mse) {
         perror("MSE allocation failed");
-        free(vector_y);
         exit(EXIT_FAILURE);
     }
 
     compute_mse_parallel(submatrix, rows, cols, vector_y, mse);
+    return mse;
+}
 
-    gettimeofday(&end, NULL);
-    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
-    printf("Slave computation time: %.6f seconds\n", elapsed);
+// Function to send MSE to master
+void send_mse_to_master(ProgramState *state, double *mse, int cols) {
+    printf("Slave connecting to master at IP %s, Port %d to send MSEs...\n", state->slaves[0].ip, state->p);
 
-    printf("Slave computed MSEs. Sending %ld bytes to master...\n", cols * sizeof(double));
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
 
-    // Send MSEs back to master
-    ssize_t total_bytes = cols * sizeof(double); // This remains unchanged
-    if (send(master_sock, mse, total_bytes, 0) != total_bytes) {
+    int buffer_size = 1024 * 1024; // 1 MB
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+
+    struct sockaddr_in master_addr;
+    memset(&master_addr, 0, sizeof(master_addr));
+    master_addr.sin_family = AF_INET;
+    master_addr.sin_port = htons(state->p);
+    inet_pton(AF_INET, state->slaves[0].ip, &master_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr *)&master_addr, sizeof(master_addr)) < 0) {
+        perror("Connection to master failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Send MSE vector
+    ssize_t total_bytes = cols * sizeof(double);
+    if (send(sock, mse, total_bytes, 0) != total_bytes) {
         perror("Failed to send MSEs");
         exit(EXIT_FAILURE);
     }
 
-    printf("Slave sent MSEs to master\n");
-
-    free(vector_y);
-    free(mse);
+    printf("Slave successfully sent MSEs to master\n");
+    close(sock);
 }
 
 void slave_listen(ProgramState *state) {
     printf("Slave on port %d starting...\n", state->p);
-
-    // Set CPU affinity for this slave process
-    int core_id = state->p % sysconf(_SC_NPROCESSORS_ONLN); // Map port to core
-    set_core_affinity(core_id);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -464,58 +463,88 @@ void slave_listen(ProgramState *state) {
 
     printf("Slave processed %d rows\n", rows);
 
-    // Compute MSE and send back to master
-    compute_mse_and_send(state, submatrix, rows, cols, master_sock);
+    // Receive vector y
+    int *vector_y = (int *)malloc(cols * sizeof(int));
+    if (!vector_y) {
+        perror("Vector y allocation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ssize_t bytes_received = 0;
+    ssize_t total_bytes = cols * sizeof(int);
+    while (bytes_received < total_bytes) {
+        ssize_t result = recv(master_sock, (char *)vector_y + bytes_received, total_bytes - bytes_received, 0);
+        if (result < 0) {
+            perror("Failed to receive vector y");
+            exit(EXIT_FAILURE);
+        }
+        bytes_received += result;
+    }
+
+    printf("Slave received vector y\n");
+
+    // Compute MSE
+    double *mse = compute_mse_only(submatrix, rows, cols, vector_y);
+
+    // Send MSE to master
+    send_mse_to_master(state, mse, cols);
 
     // Clean up
     for (int i = 0; i < rows; i++) {
         free(submatrix[i]);
     }
     free(submatrix);
+    free(vector_y);
+    free(mse);
     close(master_sock);
     close(server_fd);
 }
 
-// Collect MSEs from slaves
-void collect_mses(ProgramState *state, double *mse_vector, int cols) {
+// Receive MSEs from slaves
+void receive_mse_from_slaves(ProgramState *state, double *mse_vector, int cols) {
     int offset = 0;
 
     for (int slave = 0; slave < state->t; slave++) {
-        printf("Collecting MSEs from slave %d...\n", slave);
-        printf("Waiting to receive %ld bytes of MSE data from slave %d...\n", cols * sizeof(double), slave);
+        printf("Master listening for MSEs from slave %d on port %d...\n", slave, state->slaves[slave].port);
 
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) {
             perror("Socket creation failed");
             exit(EXIT_FAILURE);
         }
 
         int buffer_size = 1024 * 1024; // 1 MB
-        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
-        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+        setsockopt(server_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+        setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
 
-        struct timeval timeout;
-        timeout.tv_sec = 120; // Increase to 120 seconds
-        timeout.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(state->slaves[slave].port);
 
-        struct sockaddr_in slave_addr;
-        memset(&slave_addr, 0, sizeof(slave_addr));
-        slave_addr.sin_family = AF_INET;
-        slave_addr.sin_port = htons(state->slaves[slave].port);
-        inet_pton(AF_INET, state->slaves[slave].ip, &slave_addr.sin_addr);
-
-        if (connect(sock, (struct sockaddr *)&slave_addr, sizeof(slave_addr)) < 0) {
-            perror("Connection to slave failed");
-            close(sock);
+        if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+            perror("Bind failed");
             exit(EXIT_FAILURE);
         }
 
-        // Receive MSEs
+        if (listen(server_fd, 1) < 0) {
+            perror("Listen failed");
+            exit(EXIT_FAILURE);
+        }
+
+        int addrlen = sizeof(address);
+        int slave_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
+        if (slave_sock < 0) {
+            perror("Accept failed");
+            exit(EXIT_FAILURE);
+        }
+
+        // Receive MSE vector
         ssize_t bytes_received = 0;
         ssize_t total_bytes = cols * sizeof(double);
         while (bytes_received < total_bytes) {
-            ssize_t result = recv(sock, (char *)mse_vector + offset + bytes_received, total_bytes - bytes_received, 0);
+            ssize_t result = recv(slave_sock, (char *)mse_vector + offset + bytes_received, total_bytes - bytes_received, 0);
             if (result < 0) {
                 perror("Failed to receive MSEs");
                 exit(EXIT_FAILURE);
@@ -523,9 +552,11 @@ void collect_mses(ProgramState *state, double *mse_vector, int cols) {
             bytes_received += result;
         }
 
-        printf("Successfully collected MSEs from slave %d\n", slave);
+        printf("Successfully received MSEs from slave %d\n", slave);
         offset += cols;
-        close(sock);
+
+        close(slave_sock);
+        close(server_fd);
     }
 }
 
@@ -566,7 +597,6 @@ int main() {
         // Master logic for matrix allocation and distribution
         allocate_matrix(&state);
         create_matrix(&state);
-        distribute_submatrices(&state);
 
         int *vector_y = (int *)malloc(state.n * sizeof(int));
         if (!vector_y) {
@@ -579,18 +609,10 @@ int main() {
             vector_y[i] = rand() % 100 + 1;
         }
 
-        // Start total timer
-        struct timeval time_before, time_after;
-        gettimeofday(&time_before, NULL);
+        distribute_submatrices(&state, vector_y, state.n);
+        sleep(1); // Allow slaves to prepare for receiving vector y
 
         printf("Broadcasting vector y:\n");
-        // Commented out printing of vector y
-        // for (int i = 0; i < state.n; i++) {
-        //     printf("%d ", vector_y[i]);
-        // }
-        // printf("\n");
-
-        // Broadcast vector y to slaves
         broadcast_vector_y(&state, vector_y, state.n);
 
         // Collect MSEs from slaves
@@ -600,20 +622,7 @@ int main() {
             exit(EXIT_FAILURE);
         }
 
-        collect_mses(&state, mse_vector, state.n);
-
-        // End total timer
-        gettimeofday(&time_after, NULL);
-        double elapsed = (time_after.tv_sec - time_before.tv_sec) + 
-                         (time_after.tv_usec - time_before.tv_usec) / 1000000.0;
-        printf("Master total elapsed time: %.6f seconds\n", elapsed);
-
-        // printing of combined vector e (MSEs)
-        // printf("Combined vector e (MSEs):\n");
-        // for (int i = 0; i < state.n; i++) {
-        //     printf("%.6f ", mse_vector[i]);
-        // }
-        // printf("\n");
+        receive_mse_from_slaves(&state, mse_vector, state.n);
 
         free(vector_y);
         free(mse_vector);
@@ -625,3 +634,4 @@ int main() {
 
     return EXIT_SUCCESS;
 }
+

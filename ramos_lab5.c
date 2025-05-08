@@ -14,7 +14,7 @@
 #define MAX_SLAVES 16
 #define BUFFER_SIZE (1 * 1024 * 1024)  // 1MB buffer
 #define CONFIG_FILE "config.txt"
-#define CHUNK_SIZE 20              // Rows per chunk
+#define CHUNK_SIZE (state->n / (state->t * 10)) // Rows per chunk
 
 typedef struct {
     char ip[16];
